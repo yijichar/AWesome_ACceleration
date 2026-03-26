@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+#/home/zyf/workspace/Qwen-vllm-tp/llm_tp.py
 """
 L3: 引擎层 - 支持 Tensor Parallel 的推理引擎（MVP可运行版）
 基于原始 llm.py，添加多卡调度逻辑
@@ -213,8 +214,42 @@ class LLMTP:
         # ---------------------------------------------------------------------
         # Preallocated decode buffers (all ranks)
         # ---------------------------------------------------------------------
-        self._decode_input_ids = torch.zeros(self.max_num_seqs, 1, dtype=torch.long, device=self.device)
-        self._decode_positions = torch.zeros(self.max_num_seqs, 1, dtype=torch.long, device=self.device)
+        self._decode_input_ids = torch.zeros(
+            self.max_num_seqs, 1, dtype=torch.long, device=self.device
+        )
+        self._decode_positions = torch.zeros(
+            self.max_num_seqs, 1, dtype=torch.long, device=self.device
+        )
+
+        # decode packed meta: [B, 3]
+        # col0 = input_ids[:, 0]
+        # col1 = positions[:, 0]
+        # col2 = slot_indices[:]
+        self._decode_meta = torch.zeros(
+            self.max_num_seqs, 3, dtype=torch.long, device=self.device
+        )
+
+        # ---------------------------------------------------------------------
+        # Preallocated prefill recv buffers (all ranks)
+        # 说明：
+        # - rank0 在当前 flat prefill 主路径里不一定会用到这些 buffer
+        # - worker 接收 padded prefill 时可直接 slice 使用，避免频繁 torch.empty
+        # ---------------------------------------------------------------------
+        self._prefill_input_ids = torch.empty(
+            self.max_num_seqs, self.max_seq_len, dtype=torch.long, device=self.device
+        )
+        self._prefill_position_ids = torch.empty(
+            self.max_num_seqs, self.max_seq_len, dtype=torch.long, device=self.device
+        )
+        self._prefill_attention_mask = torch.empty(
+            self.max_num_seqs, self.max_seq_len, dtype=torch.bool, device=self.device
+        )
+        self._prefill_seq_lens = torch.empty(
+            self.max_num_seqs, dtype=torch.int32, device=self.device
+        )
+        self._prefill_slot_indices = torch.empty(
+            self.max_num_seqs, dtype=torch.long, device=self.device
+        )
 
         # ---------------------------------------------------------------------
         # Async queue (rank0 only)
@@ -265,28 +300,41 @@ class LLMTP:
 
     def _tp_broadcast_decode_tensors(
         self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        slot_indices: torch.Tensor,
+        input_ids: torch.Tensor,     # [B, 1]
+        positions: torch.Tensor,     # [B, 1]
+        slot_indices: torch.Tensor,  # [B]
     ):
         """
-        Rank 0 广播 decode 需要的张量给所有 worker。
+        Rank 0 将 decode 所需的 input_ids / positions / slot_indices
+        打包进一个 [B, 3] tensor，只做一次 broadcast。
         """
-        broadcast_tensor(input_ids, src=0)
-        broadcast_tensor(positions, src=0)
-        broadcast_tensor(slot_indices, src=0)
+        batch_size = input_ids.shape[0]
+        meta = self._decode_meta[:batch_size]
+
+        meta[:, 0] = input_ids[:, 0]
+        meta[:, 1] = positions[:, 0]
+        meta[:, 2] = slot_indices
+
+        broadcast_tensor(meta, src=0)
+
 
     def _tp_recv_decode_tensors(self, batch_size: int):
         """
-        Worker 接收 decode 张量（使用预分配 buffer）。
+        Worker 接收一次 packed decode meta，然后拆回：
+        - input_ids:  [B, 1]
+        - positions:  [B, 1]
+        - slot_indices: [B]
         """
+        meta = self._decode_meta[:batch_size]
         input_ids = self._decode_input_ids[:batch_size]
         positions = self._decode_positions[:batch_size]
-        slot_indices = torch.empty(batch_size, dtype=torch.long, device=self.device)
 
-        broadcast_tensor(input_ids, src=0)
-        broadcast_tensor(positions, src=0)
-        broadcast_tensor(slot_indices, src=0)
+        broadcast_tensor(meta, src=0)
+
+        input_ids[:, 0] = meta[:, 0]
+        positions[:, 0] = meta[:, 1]
+        slot_indices = meta[:, 2]   # view，不再重新分配
+
         return input_ids, positions, slot_indices
 
     def _tp_broadcast_prefill_tensors(
@@ -309,12 +357,22 @@ class LLMTP:
     def _tp_recv_prefill_tensors(self, batch_size: int, max_len: int):
         """
         Worker 接收 prefill 的 padded batch tensors。
+        使用预分配 buffer，避免每次 torch.empty。
         """
-        input_ids = torch.empty(batch_size, max_len, dtype=torch.long, device=self.device)
-        position_ids = torch.empty(batch_size, max_len, dtype=torch.long, device=self.device)
-        attention_mask = torch.empty(batch_size, max_len, dtype=torch.bool, device=self.device)
-        seq_lens = torch.empty(batch_size, dtype=torch.int32, device=self.device)
-        slot_indices = torch.empty(batch_size, dtype=torch.long, device=self.device)
+        if batch_size > self.max_num_seqs:
+            raise ValueError(
+                f"batch_size={batch_size} exceeds preallocated max_num_seqs={self.max_num_seqs}"
+            )
+        if max_len > self.max_seq_len:
+            raise ValueError(
+                f"max_len={max_len} exceeds preallocated max_seq_len={self.max_seq_len}"
+            )
+
+        input_ids = self._prefill_input_ids[:batch_size, :max_len]
+        position_ids = self._prefill_position_ids[:batch_size, :max_len]
+        attention_mask = self._prefill_attention_mask[:batch_size, :max_len]
+        seq_lens = self._prefill_seq_lens[:batch_size]
+        slot_indices = self._prefill_slot_indices[:batch_size]
 
         broadcast_tensor(input_ids, src=0)
         broadcast_tensor(position_ids, src=0)
@@ -322,7 +380,6 @@ class LLMTP:
         broadcast_tensor(seq_lens, src=0)
         broadcast_tensor(slot_indices, src=0)
         return input_ids, position_ids, attention_mask, seq_lens, slot_indices
-
     # =========================================================================
     # Core Inference
     # =========================================================================
@@ -498,17 +555,33 @@ class LLMTP:
         """
         batch_size = len(sequences)
         max_len = max(len(s) for s in sequences)
-        pad_id = self.config.eos_token_id  # 仅作为padding占位；attention_mask会屏蔽
+        pad_id = self.config.eos_token_id
 
-        input_ids = torch.full((batch_size, max_len), pad_id, dtype=torch.long, device=self.device)
-        position_ids = torch.zeros((batch_size, max_len), dtype=torch.long, device=self.device)
-        attention_mask = torch.zeros((batch_size, max_len), dtype=torch.bool, device=self.device)
-        seq_lens = torch.tensor([len(s) for s in sequences], dtype=torch.int32, device=self.device)
-        slot_indices_t = torch.tensor(slot_indices, dtype=torch.long, device=self.device)
+        if batch_size > self.max_num_seqs:
+            raise ValueError(
+                f"batch_size={batch_size} exceeds max_num_seqs={self.max_num_seqs}"
+            )
+        if max_len > self.max_seq_len:
+            raise ValueError(
+                f"max_len={max_len} exceeds max_seq_len={self.max_seq_len}"
+            )
+
+        input_ids = self._prefill_input_ids[:batch_size, :max_len]
+        position_ids = self._prefill_position_ids[:batch_size, :max_len]
+        attention_mask = self._prefill_attention_mask[:batch_size, :max_len]
+        seq_lens = self._prefill_seq_lens[:batch_size]
+        slot_indices_t = self._prefill_slot_indices[:batch_size]
+
+        input_ids.fill_(pad_id)
+        position_ids.zero_()
+        attention_mask.zero_()
 
         for i, seq in enumerate(sequences):
             L = len(seq)
-            input_ids[i, :L] = torch.tensor(seq, dtype=torch.long, device=self.device)
+            seq_lens[i] = L
+            slot_indices_t[i] = slot_indices[i]
+
+            input_ids[i, :L] = torch.as_tensor(seq, dtype=torch.long, device=self.device)
             position_ids[i, :L] = torch.arange(L, dtype=torch.long, device=self.device)
             attention_mask[i, :L] = True
 

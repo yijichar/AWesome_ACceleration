@@ -2,6 +2,7 @@
 L1: 并行层 - Tensor Parallel 线性层实现
 参考 vLLM 的 layers/linear.py
 """
+# /home/zyf/workspace/Qwen-vllm-tp/model/parallel_layers.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

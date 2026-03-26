@@ -2,6 +2,7 @@
 L2: 模型层 - 支持 Tensor Parallel 的 Qwen3 模型
 基于原始 model.py，替换为并行层
 """
+# /home/zyf/workspace/Qwen-vllm-tp/model/model_tp.py
 import json, math
 from dataclasses import dataclass
 from pathlib import Path
@@ -226,6 +227,37 @@ class AttentionTP(nn.Module):
         output = self.o_proj(attn_output)
         
         return output
+    
+    def export_kv(self, slot_idx: int, length: int) -> dict:
+        """
+        导出单个 slot 的 KV。
+        返回 CPU tensor，便于 connector 后处理。
+        """
+        if self._kv_cache is None or self._v_cache is None or self._cache_seqlens is None:
+            raise RuntimeError("KV cache is not initialized")
+
+        length = int(length)
+        return {
+            "k": self._kv_cache[slot_idx, :length].detach().cpu(),
+            "v": self._v_cache[slot_idx, :length].detach().cpu(),
+            "seqlen": int(self._cache_seqlens[slot_idx].item()),
+        }
+
+    def import_kv(self, slot_idx: int, payload: dict, length: int):
+        """
+        将外部导入的 KV 写入当前 rank 的本地 slot。
+        payload 中的 k/v 应与当前 rank 的 partition shape 对齐。
+        """
+        if self._kv_cache is None or self._v_cache is None or self._cache_seqlens is None:
+            raise RuntimeError("KV cache is not initialized")
+
+        k = payload["k"].to(device=self._kv_cache.device, dtype=self._kv_cache.dtype)
+        v = payload["v"].to(device=self._v_cache.device, dtype=self._v_cache.dtype)
+        seqlen = int(payload["seqlen"])
+
+        self._kv_cache[slot_idx, :length].copy_(k[:length])
+        self._v_cache[slot_idx, :length].copy_(v[:length])
+        self._cache_seqlens[slot_idx] = seqlen
 
 
 class MLPTP(nn.Module):
@@ -347,6 +379,33 @@ class Qwen3ForCausalLMTP(nn.Module):
             )
         
         return logits
+    
+    def export_request_kv(self, slot_idx: int, length: int) -> dict:
+        """
+        导出某个 request 在所有 layer 上的 KV。
+        payload 结构：
+        {
+            "layers": [
+                {"k": ..., "v": ..., "seqlen": ...},
+                ...
+            ]
+        }
+        """
+        layers_payload = []
+        for layer in self.model.layers:
+            layers_payload.append(layer.self_attn.export_kv(slot_idx, length))
+        return {"layers": layers_payload}
+
+    def import_request_kv(self, slot_idx: int, payload: dict, length: int):
+        layers_payload = payload["layers"]
+        if len(layers_payload) != len(self.model.layers):
+            raise ValueError(
+                f"Layer count mismatch: payload has {len(layers_payload)} layers, "
+                f"model has {len(self.model.layers)} layers"
+            )
+
+        for layer, layer_payload in zip(self.model.layers, layers_payload):
+            layer.self_attn.import_kv(slot_idx, layer_payload, length)
 
     def init_kv_cache(self, num_slots: int, max_seq_len: int, device, dtype):
         """Allocate slot-based KV cache（每个 rank 只存储自己的 heads）"""

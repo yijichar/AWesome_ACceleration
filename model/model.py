@@ -152,6 +152,29 @@ class Attention(nn.Module):
         # Delete original projections to free memory
         del self.q_proj, self.k_proj, self.v_proj
         self.q_proj = self.k_proj = self.v_proj = None
+    
+    def export_kv(self, slot_idx: int, length: int) -> dict:
+        if self._kv_cache is None or self._v_cache is None or self._cache_seqlens is None:
+            raise RuntimeError("KV cache is not initialized")
+
+        length = int(length)
+        return {
+            "k": self._kv_cache[slot_idx, :length].detach().cpu(),
+            "v": self._v_cache[slot_idx, :length].detach().cpu(),
+            "seqlen": int(self._cache_seqlens[slot_idx].item()),
+        }
+
+    def import_kv(self, slot_idx: int, payload: dict, length: int):
+        if self._kv_cache is None or self._v_cache is None or self._cache_seqlens is None:
+            raise RuntimeError("KV cache is not initialized")
+
+        k = payload["k"].to(device=self._kv_cache.device, dtype=self._kv_cache.dtype)
+        v = payload["v"].to(device=self._v_cache.device, dtype=self._v_cache.dtype)
+        seqlen = int(payload["seqlen"])
+
+        self._kv_cache[slot_idx, :length].copy_(k[:length])
+        self._v_cache[slot_idx, :length].copy_(v[:length])
+        self._cache_seqlens[slot_idx] = seqlen
 
 
 class MLP(nn.Module):
@@ -359,3 +382,20 @@ class Qwen3ForCausalLM(nn.Module):
         
         model = model.to(device)
         return model
+    
+    def export_request_kv(self, slot_idx: int, length: int) -> dict:
+        layers_payload = []
+        for layer in self.model.layers:
+            layers_payload.append(layer.self_attn.export_kv(slot_idx, length))
+        return {"layers": layers_payload}
+
+    def import_request_kv(self, slot_idx: int, payload: dict, length: int):
+        layers_payload = payload["layers"]
+        if len(layers_payload) != len(self.model.layers):
+            raise ValueError(
+                f"Layer count mismatch: payload has {len(layers_payload)}, "
+                f"model has {len(self.model.layers)}"
+            )
+
+        for layer, lp in zip(self.model.layers, layers_payload):
+            layer.self_attn.import_kv(slot_idx, lp, length)

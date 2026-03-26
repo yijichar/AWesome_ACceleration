@@ -1,6 +1,7 @@
 """
 L0: 分布式运行时层 - Tensor Parallel / DP×TP 通信封装
 """
+# /home/zyf/workspace/Qwen-vllm-tp/model/distributed.py
 import os
 import torch
 import torch.distributed as dist
