@@ -13,6 +13,7 @@ This project focuses on efficient **KV cache management**, **continuous batching
 - **Paged KV cache** for dynamic sequence growth without repeated reallocation
 - **Tensor Parallel (TP)** inference for multi-GPU model execution
 - **Data Parallel (DP)** and **hybrid DP×TP** support for higher-throughput benchmarking
+- **PD Separation** supports the Prefill-Decode Disaggregation Architecture
 - **Two-level parallel design** with **per-replica scheduling + intra-replica tensor parallelism**
 - **Profiling support** for communication overhead such as broadcast, all-reduce, and all-gather
 - **Packed decode-stage broadcast optimization** to reduce control-path communication overhead
