@@ -26,7 +26,6 @@ On **4× RTX 4090 GPUs**, we benchmarked **Qwen3-0.6B** with **256 sequences**, 
 - **Data Parallel (2 GPUs):** **12209 tok/s**
 - **DP×TP (4 GPUs, 2-way DP × 2-way TP):** **21687 tok/s**
 
-
 ---
 
 ## Project Structure
