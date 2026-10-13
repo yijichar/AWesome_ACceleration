@@ -45,4 +45,4 @@ On **4× RTX 4090 GPUs**, we benchmarked **Qwen3-0.6B** with **256 sequences**, 
 
 ## TODO
 
-- [ ] Extend the current PyTorch inference engine to support **Qwen3-30B-A3B MoE** models.
+- Extend the current PyTorch inference engine to support **Qwen3-30B-A3B MoE** models.
